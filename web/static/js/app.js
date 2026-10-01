@@ -19,9 +19,6 @@
 
   const setConnection = (authenticated, session = {}) => {
     authenticatedState = authenticated;
-    const connection = document.querySelector(".connection");
-    connection.innerHTML = `<i></i>${authenticated ? "超星已连接" : "未登录"}`;
-    connection.classList.toggle("offline", !authenticated);
     document.querySelector("#open-login").hidden = authenticated;
     document.querySelector("#user-info").hidden = !authenticated;
     if (!authenticated) {
@@ -275,6 +272,15 @@
       document.querySelector("#current-section").textContent = item.dataset.section;
       if (item.dataset.section === "课程管理") {
         window.location.href = "/courses";
+        return;
+      } else if (item.dataset.section === "运行记录") {
+        window.location.href = "/records";
+        return;
+      } else if (item.dataset.section === "执行中心") {
+        window.location.href = "/execution";
+        return;
+      } else if (item.dataset.section === "系统设置") {
+        window.location.href = "/settings";
         return;
       } else if (item.dataset.section === "首页") {
         window.scrollTo({top: 0, behavior: "smooth"});

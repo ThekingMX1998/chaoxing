@@ -1,21 +1,118 @@
 from datetime import datetime, timedelta, timezone
+import json
 import multiprocessing as mp
+import os
+from pathlib import Path
 from queue import Empty
+import tempfile
 from threading import Event, RLock, Thread
 import time
 from tqdm import tqdm as TqdmClass
+from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request
 
 from api.base import Account, Chaoxing, StudyResult
 from api.answer import DummyTiku
-from api.logger import logger as api_logger
-from executor import process_job
+from api.logger import logger as api_logger, tqdm_sink
+from executor import build_study_client, process_job
+
+
+# Web 端只保留终端/内存日志，不再创建或追加 chaoxing.log 文件。
+# api.logger 的默认文件 sink 来自旧 CLI，这里在生产入口侧替换掉它，避免修改 api/。
+api_logger.remove()
+api_logger.add(tqdm_sink, colorize=True, enqueue=True)
 
 
 def format_duration(value) -> str:
     seconds = max(0, int(float(value or 0)))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def queue_item_key(item: dict) -> tuple:
+    """返回队列项的稳定键，课程和任务使用不同的去重粒度。"""
+    course_id = str(item.get("courseId") or item.get("id") or "")
+    if item.get("mode") == "task" or item.get("taskId"):
+        task_id = str(item.get("taskId") or item.get("jobid") or item.get("jobId") or item.get("id") or "")
+        point_id = str(item.get("pointId") or item.get("knowledgeId") or "")
+        return "task", course_id, point_id, task_id
+    return "course", course_id
+
+
+RECORDS_FILE = Path(__file__).resolve().parent / "data" / "records.json"
+SETTINGS_FILE = Path(__file__).resolve().parent / "data" / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "common": {"speed": 1, "jobs": 4, "notopen_action": "retry", "retry_interval": 1.0, "work_redo_enabled": False, "work_max_retries": 3, "add_learning_count": False, "target_count": 100},
+    "tiku": {"provider": "TikuYanxi", "check_llm_connection": True, "submit": False, "cover_rate": 0.9, "delay": 1.0, "tokens": "", "likeapi_search": False, "likeapi_vision": True, "likeapi_model": "glm-4.5-air", "likeapi_retry": True, "likeapi_retry_times": 3, "url": "", "go_authorization": "", "go_min_interval": 1.0, "go_retry_times": 3, "go_retry_backoff": 1.2, "endpoint": "", "key": "", "model": "", "min_interval_seconds": 3, "http_proxy": "", "siliconflow_key": "", "siliconflow_model": "deepseek-ai/DeepSeek-R1", "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions", "manual_mode_default": "batch", "manual_mode_separator": ";", "true_list": "正确,对,√,是", "false_list": "错误,错,×,否,不对,不正确"},
+    "notification": {"provider": "ServerChan", "url": "", "tg_chat_id": "XXXXXX"},
+}
+
+
+def load_settings() -> dict:
+    try:
+        with SETTINGS_FILE.open("r", encoding="utf-8") as stream:
+            saved = json.load(stream)
+        settings = json.loads(json.dumps(DEFAULT_SETTINGS))
+        for section, values in saved.items():
+            if section in settings and isinstance(values, dict):
+                settings[section].update({key: value for key, value in values.items() if key in settings[section]})
+        return settings
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return json.loads(json.dumps(DEFAULT_SETTINGS))
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(prefix="settings-", suffix=".json", dir=SETTINGS_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(settings, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, SETTINGS_FILE)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def load_records() -> list[dict]:
+    try:
+        with RECORDS_FILE.open("r", encoding="utf-8") as stream:
+            records = json.load(stream)
+        if not isinstance(records, list):
+            return []
+        normalized = []
+        for index, record in enumerate(records):
+            if isinstance(record, dict):
+                record = dict(record)
+                record.setdefault("id", f"legacy-{index}")
+                normalized.append(record)
+        return normalized
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return []
+
+
+def save_records(records: list[dict]) -> None:
+    """原子保存结构化运行记录，不保存账号凭据或终端日志。"""
+    try:
+        RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(prefix="records-", suffix=".json", dir=RECORDS_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(records[-500:], stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, RECORDS_FILE)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+    except (OSError, TypeError, ValueError):
+        # 记录保存失败不影响课程同步或任务执行。
+        return
 
 
 class TimeDisplayTqdm(TqdmClass):
@@ -90,12 +187,11 @@ class ProgressProxy:
         self._send()
 
 
-def run_job_process(result_queue, username, password, use_cookies, course, job, job_info):
+def run_job_process(result_queue, username, password, use_cookies, settings, course, job, job_info):
     """在独立进程中运行 api/ 的任务方法，便于 Web 层安全终止当前任务。"""
     try:
         log_sink_id = api_logger.add(lambda message: result_queue.put({"type": "log", "line": str(message).rstrip()}), level="TRACE", enqueue=False)
-        client = Chaoxing(Account(username, password))
-        client.tiku = DummyTiku()
+        client = build_study_client(Account(username, password), settings)
         login_result = client.login(login_with_cookies=use_cookies)
         if not login_result.get("status"):
             result_queue.put({"ok": False, "message": login_result.get("msg", "子进程登录失败")})
@@ -115,7 +211,8 @@ def run_job_process(result_queue, username, password, use_cookies, course, job, 
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.extensions["chaoxing"] = {"client": None, "username": None, "password": None, "use_cookies": False, "display_name": None, "courses": [], "queue": [], "queue_status": "idle", "activities": [], "logs": [], "terminal_logs": [], "progress": {"total": 0, "completed": 0, "failed": 0, "current": "", "played": 0, "duration": 0}, "stop_event": Event(), "pause_event": Event(), "worker": None, "lock": RLock()}
+    saved_records = load_records()
+    app.extensions["chaoxing"] = {"client": None, "username": None, "password": None, "use_cookies": False, "display_name": None, "courses": [], "queue": [], "queue_status": "idle", "activities": list(reversed(saved_records[-20:])), "logs": [], "terminal_logs": [], "progress": {"total": 0, "completed": 0, "failed": 0, "current": "", "played": 0, "duration": 0}, "stop_event": Event(), "pause_event": Event(), "worker": None, "lock": RLock(), "records": saved_records, "settings": load_settings()}
 
     def terminal_log_sink(message):
         line = str(message).rstrip()
@@ -131,20 +228,23 @@ def create_app() -> Flask:
 
     def record_event(title: str, detail: str, level: str = "info"):
         now = datetime.now(timezone(timedelta(hours=8)))
-        event = {"title": title, "detail": detail, "level": level, "time": now.strftime("%H:%M:%S"), "timestamp": now.isoformat()}
+        event = {"id": uuid4().hex, "title": title, "detail": detail, "level": level, "time": now.strftime("%H:%M:%S"), "timestamp": now.isoformat()}
         current = state()
         with current["lock"]:
             current["activities"].insert(0, event)
             current["logs"].insert(0, event)
             current["activities"] = current["activities"][:20]
             current["logs"] = current["logs"][:100]
+            current["records"].append(event)
+            current["records"] = current["records"][-500:]
+            save_records(current["records"])
 
     def run_job_interruptible(current, course, job, job_info):
         context = mp.get_context("spawn")
         result_queue = context.Queue()
         process = context.Process(
             target=run_job_process,
-            args=(result_queue, current["username"], current["password"], current["use_cookies"], course, job, job_info),
+            args=(result_queue, current["username"], current["password"], current["use_cookies"], current["settings"], course, job, job_info),
             daemon=True,
         )
         process.start()
@@ -200,6 +300,9 @@ def create_app() -> Flask:
                 if current["stop_event"].is_set():
                     break
                 course_id = str(item.get("courseId"))
+                item_mode = item.get("mode", "course")
+                selected_task_id = str(item.get("taskId") or "")
+                selected_point_id = str(item.get("pointId") or "")
                 course = next((c for c in current["courses"] if str(c.get("courseId")) == course_id), None)
                 if course is None:
                     course = next((c for c in client.get_course_list() if str(c.get("courseId")) == course_id), None)
@@ -209,8 +312,10 @@ def create_app() -> Flask:
                     continue
                 point_data = client.get_course_point(course["courseId"], course["clazzId"], course.get("cpi"))
                 points = point_data.get("points", []) if isinstance(point_data, dict) else point_data
-                runnable_points = [point for point in points if not point.get("has_finished", False)]
-                current["progress"]["total"] += sum(int(point.get("jobCount", 0) or 0) for point in runnable_points)
+                if item_mode == "task":
+                    runnable_points = [point for point in points if str(point.get("id") or point.get("knowledgeId")) == selected_point_id]
+                else:
+                    runnable_points = [point for point in points if not point.get("has_finished", False)]
                 for point in runnable_points:
                     if current["stop_event"].is_set():
                         break
@@ -222,6 +327,10 @@ def create_app() -> Flask:
                         current["queue_status"] = "running"
                         current["progress"]["current"] = f"{course.get('title', course_id)} / {point.get('title', point.get('id', '章节'))}"
                     jobs, job_info = client.get_job_list(course, point)
+                    if item_mode == "task":
+                        jobs = [job for job in jobs if str(job.get("jobid") or job.get("jobId") or job.get("id")) == selected_task_id]
+                    with current["lock"]:
+                        current["progress"]["total"] += len(jobs) if jobs else (1 if item_mode == "task" else int(point.get("jobCount", 0) or 0))
                     for job in jobs:
                         if current["stop_event"].is_set():
                             break
@@ -283,9 +392,21 @@ def create_app() -> Flask:
     def dashboard():
         return render_template("index.html")
 
+    @app.get("/execution")
+    def execution_center():
+        return render_template("execution.html")
+
     @app.get("/courses")
     def course_management():
         return render_template("courses.html")
+
+    @app.get("/records")
+    def run_records():
+        return render_template("records.html")
+
+    @app.get("/settings")
+    def system_settings():
+        return render_template("settings.html")
 
     @app.get("/api/session")
     def session_status():
@@ -393,15 +514,31 @@ def create_app() -> Flask:
         current = state()
         with current["lock"]:
             incoming = courses if courses else tasks
-            existing_keys = {str(item.get("courseId") or item.get("id")) for item in current["queue"]}
-            for item in incoming:
-                item_key = str(item.get("courseId") or item.get("id"))
-                if item_key not in existing_keys:
+            normalized = []
+            for raw_item in incoming:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = dict(raw_item)
+                if courses:
+                    item["mode"] = "course"
+                else:
+                    item["mode"] = "task"
+                    item["taskId"] = str(item.get("taskId") or item.get("jobid") or item.get("jobId") or item.get("id") or "")
+                    item["pointId"] = str(item.get("pointId") or item.get("knowledgeId") or "")
+                normalized.append(item)
+            existing_keys = {queue_item_key(item) for item in current["queue"]}
+            added = 0
+            for item in normalized:
+                item_key = queue_item_key(item)
+                if item_key[1] and item_key not in existing_keys:
                     current["queue"].append(item)
                     existing_keys.add(item_key)
+                    added += 1
+            if not added:
+                return jsonify({"ok": False, "message": "所选任务已经在执行队列中"}), 409
             current["queue_status"] = "queued"
-            record_event("任务加入队列", f"新增 {len(incoming)} 项，当前队列 {len(current['queue'])} 项")
-        return jsonify({"ok": True, "count": len(current["queue"]), "status": "queued", "mode": "course" if courses else "task"})
+            record_event("任务加入队列", f"新增 {added} 项，当前队列 {len(current['queue'])} 项")
+        return jsonify({"ok": True, "added": added, "count": len(current["queue"]), "status": "queued", "mode": "course" if courses else "task"})
 
     @app.get("/api/tasks/status")
     def task_status():
@@ -409,7 +546,14 @@ def create_app() -> Flask:
         progress = dict(current["progress"])
         progress["playedText"] = format_duration(progress.get("played", 0))
         progress["durationText"] = format_duration(progress.get("duration", 0))
-        queue = [{"courseId": item.get("courseId") or item.get("id"), "name": item.get("name") or item.get("title") or "未命名课程"} for item in current["queue"]]
+        queue = [{
+            "courseId": item.get("courseId") or item.get("id"),
+            "name": item.get("name") or item.get("title") or "未命名课程",
+            "mode": item.get("mode", "course"),
+            "taskId": item.get("taskId"),
+            "pointId": item.get("pointId"),
+            "type": item.get("type"),
+        } for item in current["queue"]]
         return jsonify({"ok": True, "status": current["queue_status"], "count": len(queue), "queue": queue, "progress": progress})
 
     @app.delete("/api/tasks/queue/<course_id>")
@@ -417,9 +561,14 @@ def create_app() -> Flask:
         current = state()
         if current["queue_status"] in {"running", "paused", "stopping"}:
             return jsonify({"ok": False, "message": "执行期间不能修改队列"}), 409
+        task_id = request.args.get("task_id")
+        point_id = request.args.get("point_id")
         with current["lock"]:
             before = len(current["queue"])
-            current["queue"] = [item for item in current["queue"] if str(item.get("courseId") or item.get("id")) != str(course_id)]
+            if task_id is not None:
+                current["queue"] = [item for item in current["queue"] if queue_item_key(item) != ("task", str(course_id), str(point_id or ""), str(task_id))]
+            else:
+                current["queue"] = [item for item in current["queue"] if str(item.get("courseId") or item.get("id")) != str(course_id)]
             removed = before != len(current["queue"])
             if not current["queue"]:
                 current["queue_status"] = "idle"
@@ -475,6 +624,61 @@ def create_app() -> Flask:
     @app.get("/api/activities")
     def activities():
         return jsonify({"ok": True, "activities": state()["activities"][:10]})
+
+    @app.get("/api/records")
+    def records():
+        current = state()
+        with current["lock"]:
+            records = list(reversed(current["records"][-500:]))
+        return jsonify({"ok": True, "records": records})
+
+    @app.delete("/api/records")
+    def clear_records():
+        current = state()
+        with current["lock"]:
+            current["records"] = []
+            current["activities"] = []
+            current["logs"] = []
+            save_records([])
+        return jsonify({"ok": True, "message": "运行记录已全部删除"})
+
+    @app.delete("/api/records/<record_id>")
+    def delete_record(record_id: str):
+        current = state()
+        with current["lock"]:
+            before = len(current["records"])
+            current["records"] = [record for record in current["records"] if str(record.get("id")) != str(record_id)]
+            if len(current["records"]) == before:
+                return jsonify({"ok": False, "message": "记录不存在"}), 404
+            current["activities"] = [record for record in current["activities"] if str(record.get("id")) != str(record_id)]
+            current["logs"] = [record for record in current["logs"] if str(record.get("id")) != str(record_id)]
+            save_records(current["records"])
+        return jsonify({"ok": True})
+
+    @app.get("/api/settings")
+    def get_settings():
+        return jsonify({"ok": True, "settings": state()["settings"]})
+
+    @app.get("/api/settings/defaults")
+    def get_default_settings():
+        return jsonify({"ok": True, "settings": json.loads(json.dumps(DEFAULT_SETTINGS))})
+
+    @app.put("/api/settings")
+    def update_settings():
+        payload = request.get_json(silent=True) or {}
+        incoming = payload.get("settings", payload)
+        if not isinstance(incoming, dict):
+            return jsonify({"ok": False, "message": "配置格式不正确"}), 400
+        current = state()
+        with current["lock"]:
+            for section, values in incoming.items():
+                if section in current["settings"] and isinstance(values, dict):
+                    for key, value in values.items():
+                        if key in current["settings"][section]:
+                            current["settings"][section][key] = value
+            save_settings(current["settings"])
+            record_event("系统设置已保存", "配置已写入本地设置文件")
+        return jsonify({"ok": True, "settings": current["settings"]})
 
     @app.get("/api/logs")
     def logs():

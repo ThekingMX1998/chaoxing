@@ -8,8 +8,44 @@ so the existing tqdm progress lifecycle is preserved for the Web adapter.
 import threading
 
 from api.base import Chaoxing, StudyResult
+from api.answer import DummyTiku, Tiku
 from api.live import Live
 from api.live_process import LiveProcessor
+
+
+def _config_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def build_study_client(account, settings: dict | None = None) -> Chaoxing:
+    """根据 Web 系统设置构造与旧 CLI 相同的题库和学习参数。"""
+    settings = settings or {}
+    common = settings.get("common", {})
+    tiku_config = {
+        key: _config_value(value)
+        for key, value in (settings.get("tiku", {}) or {}).items()
+    }
+    tiku_config["provider"] = ",".join(
+        provider.strip() for provider in tiku_config.get("provider", "").split(",") if provider.strip()
+    )
+    tiku_config["tokens"] = ",".join(
+        token.strip() for token in tiku_config.get("tokens", "").split(",") if token.strip()
+    )
+    tiku = DummyTiku()
+    if tiku_config.get("provider", "").strip():
+        if "TikuYanxi" in tiku_config["provider"] and not tiku_config["tokens"]:
+            raise ValueError("言溪题库未配置有效 TOKEN，请在系统设置中填写 tokens")
+        tiku = Tiku.get_tiku_from_config(tiku_config)
+        tiku.init_tiku()
+    return Chaoxing(
+        account=account,
+        tiku=tiku,
+        query_delay=float(tiku_config.get("delay", 0) or 0),
+        work_max_retries=int(common.get("work_max_retries", 3) or 3),
+        work_redo_enabled=bool(common.get("work_redo_enabled", False)),
+    )
 
 
 def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float = 1.0) -> StudyResult:

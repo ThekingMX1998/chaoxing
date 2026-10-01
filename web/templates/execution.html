@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>执行中心 · 超星学习通</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+    <style>
+      .execution-page{max-width:1240px}.page-title{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin-bottom:22px}.page-title h1{margin:0 0 6px;font-size:26px}.page-title p{margin:0;color:var(--muted);font-size:13px}.page-actions{display:flex;gap:8px;align-items:center}.page-button{border:1px solid var(--border);border-radius:9px;background:#fff;color:var(--text);padding:9px 12px;font:inherit;font-size:12px;font-weight:600;cursor:pointer}.page-button:hover{border-color:#aaa7f5;color:var(--primary)}.page-button.primary{border-color:var(--primary);background:var(--primary);color:#fff}.page-button.danger{color:var(--red)}.page-button:disabled{opacity:.5;cursor:not-allowed}.execution-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.execution-metric{background:#fff;border:1px solid var(--border);border-radius:13px;padding:16px}.execution-metric span{display:block;color:var(--muted);font-size:11px}.execution-metric strong{display:block;font-size:24px;margin-top:7px}.execution-metric small{display:block;color:var(--muted);font-size:10px;margin-top:5px}.execution-layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:18px}.execution-panel{background:#fff;border:1px solid var(--border);border-radius:13px;padding:18px}.execution-panel+.execution-panel{margin-top:18px}.execution-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}.execution-panel-head h2{margin:0;font-size:15px}.execution-panel-head small{color:var(--muted);font-size:11px}.state-pill{border-radius:99px;padding:5px 9px;background:var(--primary-soft);color:var(--primary);font-size:10px;font-weight:700;white-space:nowrap}.state-pill.running{background:var(--green-soft);color:var(--green)}.state-pill.paused,.state-pill.stopping{background:var(--orange-soft);color:var(--orange)}.state-pill.error{background:var(--red-soft);color:var(--red)}.current-task{border:1px solid var(--border);border-radius:11px;background:#fafbff;padding:15px;margin-bottom:15px}.current-task-label{font-size:10px;color:var(--muted);margin-bottom:6px}.current-task-name{font-size:14px;font-weight:700;min-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.current-task-meta{display:flex;justify-content:space-between;gap:12px;margin-top:12px;color:var(--muted);font-size:11px}.current-task-meta strong{color:var(--text);font-weight:600}.main-progress{height:9px;background:#edf0f5;border-radius:99px;overflow:hidden;margin:11px 0 7px}.main-progress i{display:block;width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,#7168f0,var(--primary));transition:width .25s}.video-progress{display:flex;justify-content:space-between;color:var(--muted);font-size:11px}.video-progress strong{color:var(--primary)}.execution-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.execution-actions .page-button{min-width:92px}.queue-list-large{display:grid;gap:9px}.queue-row{display:flex;align-items:center;gap:11px;border:1px solid var(--border);border-radius:10px;padding:12px}.queue-index{width:25px;height:25px;display:grid;place-items:center;border-radius:8px;background:var(--primary-soft);color:var(--primary);font-size:11px;font-weight:700;flex:0 0 25px}.queue-row-copy{min-width:0;flex:1}.queue-row-copy strong{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.queue-row-copy small{display:block;margin-top:4px;color:var(--muted);font-size:10px}.queue-remove{border:0;background:transparent;color:var(--red);font-size:11px;cursor:pointer;padding:5px}.queue-remove:hover{text-decoration:underline}.log-toolbar{display:flex;align-items:center;gap:8px}.log-refresh{border:0;background:transparent;color:var(--primary);font-size:11px;font-weight:650;cursor:pointer}.console{height:355px;overflow:auto;border-radius:10px;background:#111827;color:#d7def1;padding:13px;font:11px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.console-line{padding:1px 0}.console-empty{color:#8490aa;text-align:center;padding:65px 10px}.execution-note{margin:13px 0 0;color:var(--muted);font-size:11px;line-height:1.6}.empty-state{padding:35px;text-align:center;color:var(--muted);font-size:12px}.nav-item{text-decoration:none}@media(max-width:900px){.execution-layout{grid-template-columns:1fr}.execution-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:540px){.page-title{display:block}.page-actions{margin-top:14px}.execution-metrics{gap:9px}.execution-metric{padding:13px}.execution-metric strong{font-size:21px}.execution-panel{padding:14px}.current-task-meta{display:grid;gap:5px}.execution-actions .page-button{flex:1}.queue-row{align-items:flex-start}.queue-remove{padding-top:2px}}
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark">学</span><span>超星学习通</span></div>
+        <nav class="nav" aria-label="主导航">
+          <a class="nav-item" href="/"><span>⌂</span>首页</a>
+          <a class="nav-item" href="/courses"><span>▣</span>课程管理</a>
+          <a class="nav-item active" href="/execution"><span>▶</span>执行中心</a>
+          <a class="nav-item" href="/records"><span>↺</span>运行记录</a>
+          <a class="nav-item" href="/settings"><span>⚙</span>系统设置</a>
+        </nav>
+        <div class="sidebar-foot">本地控制台<br>执行中心 · v0.1.0</div>
+      </aside>
+      <main class="main">
+        <header class="topbar"><div class="breadcrumb"><strong>执行中心</strong><span> / 队列控制</span></div><div class="top-actions"><a href="/courses" class="text-button">去课程管理</a></div></header>
+        <section class="content execution-page">
+          <div class="page-title"><div><div class="eyebrow">EXECUTION CENTER</div><h1>执行中心</h1><p>集中查看队列、播放进度和执行日志。</p></div><div class="page-actions"><button class="page-button" id="refresh-execution" type="button">刷新状态 ↻</button></div></div>
+          <div class="execution-metrics">
+            <article class="execution-metric"><span>队列课程</span><strong id="metric-queue">0</strong><small id="metric-queue-hint">等待加入课程</small></article>
+            <article class="execution-metric"><span>任务进度</span><strong id="metric-progress">0%</strong><small id="metric-progress-hint">0 / 0 个任务</small></article>
+            <article class="execution-metric"><span>已完成</span><strong id="metric-completed">0</strong><small>本次执行队列</small></article>
+            <article class="execution-metric"><span>失败任务</span><strong id="metric-failed">0</strong><small id="metric-failed-hint">当前没有失败任务</small></article>
+          </div>
+          <div class="execution-layout">
+            <div>
+              <section class="execution-panel">
+                <div class="execution-panel-head"><h2>当前执行</h2><span class="state-pill" id="execution-state">队列空闲</span></div>
+                <div class="current-task">
+                  <div class="current-task-label">当前任务</div>
+                  <div class="current-task-name" id="current-task">等待开始</div>
+                  <div class="current-task-meta"><span>队列进度 <strong id="task-progress">0 / 0 个任务</strong></span><span>执行状态 <strong id="current-status">队列空闲</strong></span></div>
+                  <div class="main-progress"><i id="main-progress-bar"></i></div>
+                  <div class="video-progress"><span>播放进度</span><strong id="video-progress">--:-- / --:--</strong></div>
+                </div>
+                <div class="execution-actions"><button class="page-button primary" id="start-tasks" type="button">▶ 开始执行</button><button class="page-button" id="pause-tasks" type="button" disabled>暂停</button><button class="page-button danger" id="stop-tasks" type="button" disabled>停止</button></div>
+                <p class="execution-note">开始执行后，系统会按队列顺序处理课程中尚未完成的章节和任务点。暂停在当前任务完成或边界处生效，停止会终止当前任务。</p>
+              </section>
+              <section class="execution-panel">
+                <div class="execution-panel-head"><h2>执行队列</h2><small id="queue-hint">0 门课程</small></div>
+                <div class="queue-list-large" id="queue-list"><div class="empty-state">执行队列为空，请先在课程管理中加入课程。</div></div>
+              </section>
+            </div>
+            <section class="execution-panel">
+              <div class="execution-panel-head"><h2>终端日志</h2><div class="log-toolbar"><small id="log-hint">INFO</small><button class="log-refresh" id="refresh-logs" type="button">刷新</button></div></div>
+              <div class="console" id="console"><div class="console-empty">暂无终端日志</div></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="{{ url_for('static', filename='js/execution.js') }}"></script>
+  </body>
+</html>
