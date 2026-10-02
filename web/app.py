@@ -1,21 +1,24 @@
 from datetime import datetime, timedelta, timezone
+from contextvars import ContextVar
+import hashlib
 import json
 import multiprocessing as mp
 import os
-from pathlib import Path
 from queue import Empty
-import tempfile
+import requests
+import secrets
 from threading import Event, RLock, Thread
 import time
 from tqdm import tqdm as TqdmClass
 from uuid import uuid4
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, has_request_context, jsonify, redirect, render_template, request, session
 
-from api.base import Account, Chaoxing, StudyResult
+from api.base import Account, Chaoxing, SessionManager, StudyResult
 from api.answer import DummyTiku
 from api.logger import logger as api_logger, tqdm_sink
 from executor import build_study_client, process_job
+from web.storage import init_storage, load_records, load_settings, save_records, save_settings
 
 
 # Web 端只保留终端/内存日志，不再创建或追加 chaoxing.log 文件。
@@ -39,80 +42,11 @@ def queue_item_key(item: dict) -> tuple:
     return "course", course_id
 
 
-RECORDS_FILE = Path(__file__).resolve().parent / "data" / "records.json"
-SETTINGS_FILE = Path(__file__).resolve().parent / "data" / "settings.json"
-
 DEFAULT_SETTINGS = {
     "common": {"speed": 1, "jobs": 4, "notopen_action": "retry", "retry_interval": 1.0, "work_redo_enabled": False, "work_max_retries": 3, "add_learning_count": False, "target_count": 100},
     "tiku": {"provider": "TikuYanxi", "check_llm_connection": True, "submit": False, "cover_rate": 0.9, "delay": 1.0, "tokens": "", "likeapi_search": False, "likeapi_vision": True, "likeapi_model": "glm-4.5-air", "likeapi_retry": True, "likeapi_retry_times": 3, "url": "", "go_authorization": "", "go_min_interval": 1.0, "go_retry_times": 3, "go_retry_backoff": 1.2, "endpoint": "", "key": "", "model": "", "min_interval_seconds": 3, "http_proxy": "", "siliconflow_key": "", "siliconflow_model": "deepseek-ai/DeepSeek-R1", "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions", "manual_mode_default": "batch", "manual_mode_separator": ";", "true_list": "正确,对,√,是", "false_list": "错误,错,×,否,不对,不正确"},
     "notification": {"provider": "ServerChan", "url": "", "tg_chat_id": "XXXXXX"},
 }
-
-
-def load_settings() -> dict:
-    try:
-        with SETTINGS_FILE.open("r", encoding="utf-8") as stream:
-            saved = json.load(stream)
-        settings = json.loads(json.dumps(DEFAULT_SETTINGS))
-        for section, values in saved.items():
-            if section in settings and isinstance(values, dict):
-                settings[section].update({key: value for key, value in values.items() if key in settings[section]})
-        return settings
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        return json.loads(json.dumps(DEFAULT_SETTINGS))
-
-
-def save_settings(settings: dict) -> None:
-    try:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary_name = tempfile.mkstemp(prefix="settings-", suffix=".json", dir=SETTINGS_FILE.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(settings, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_name, SETTINGS_FILE)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
-    except (OSError, TypeError, ValueError):
-        return
-
-
-def load_records() -> list[dict]:
-    try:
-        with RECORDS_FILE.open("r", encoding="utf-8") as stream:
-            records = json.load(stream)
-        if not isinstance(records, list):
-            return []
-        normalized = []
-        for index, record in enumerate(records):
-            if isinstance(record, dict):
-                record = dict(record)
-                record.setdefault("id", f"legacy-{index}")
-                normalized.append(record)
-        return normalized
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        return []
-
-
-def save_records(records: list[dict]) -> None:
-    """原子保存结构化运行记录，不保存账号凭据或终端日志。"""
-    try:
-        RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary_name = tempfile.mkstemp(prefix="records-", suffix=".json", dir=RECORDS_FILE.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(records[-500:], stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_name, RECORDS_FILE)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
-    except (OSError, TypeError, ValueError):
-        # 记录保存失败不影响课程同步或任务执行。
-        return
 
 
 class TimeDisplayTqdm(TqdmClass):
@@ -187,12 +121,29 @@ class ProgressProxy:
         self._send()
 
 
-def run_job_process(result_queue, username, password, use_cookies, settings, course, job, job_info):
+def run_job_process(result_queue, username, password, settings, course, job, job_info):
     """在独立进程中运行 api/ 的任务方法，便于 Web 层安全终止当前任务。"""
+    cookie_manager = None
+    original_init = None
+    original_update_cookies = None
+    original_save_cookies = None
+    previous_session = None
     try:
         log_sink_id = api_logger.add(lambda message: result_queue.put({"type": "log", "line": str(message).rstrip()}), level="TRACE", enqueue=False)
+        import api.base as base_module
+        cookie_manager = SessionManager.get_instance()
+        previous_session = cookie_manager._session
+        original_init = SessionManager.__init__
+        original_update_cookies = SessionManager.__dict__["update_cookies"]
+        original_save_cookies = base_module.save_cookies
+        clean_session = requests.Session()
+        clean_session.headers.update(dict(previous_session.headers))
+        cookie_manager._session = clean_session
+        SessionManager.__init__ = lambda _self: None
+        SessionManager.update_cookies = classmethod(lambda _cls: None)
+        base_module.save_cookies = lambda source: cookie_manager._session.cookies.update(source.cookies)
         client = build_study_client(Account(username, password), settings)
-        login_result = client.login(login_with_cookies=use_cookies)
+        login_result = client.login()
         if not login_result.get("status"):
             result_queue.put({"ok": False, "message": login_result.get("msg", "子进程登录失败")})
             return
@@ -203,6 +154,12 @@ def run_job_process(result_queue, username, password, use_cookies, settings, cou
     except Exception as exc:
         result_queue.put({"ok": False, "message": str(exc)})
     finally:
+        if cookie_manager is not None:
+            cookie_manager._session = previous_session
+            SessionManager.__init__ = original_init
+            SessionManager.update_cookies = original_update_cookies
+            import api.base as base_module
+            base_module.save_cookies = original_save_cookies
         try:
             api_logger.remove(log_sink_id)
         except (UnboundLocalError, ValueError):
@@ -211,25 +168,117 @@ def run_job_process(result_queue, username, password, use_cookies, settings, cou
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    saved_records = load_records()
-    app.extensions["chaoxing"] = {"client": None, "username": None, "password": None, "use_cookies": False, "display_name": None, "courses": [], "queue": [], "queue_status": "idle", "activities": list(reversed(saved_records[-20:])), "logs": [], "terminal_logs": [], "progress": {"total": 0, "completed": 0, "failed": 0, "current": "", "played": 0, "duration": 0}, "stop_event": Event(), "pause_event": Event(), "worker": None, "lock": RLock(), "records": saved_records, "settings": load_settings()}
+    app.secret_key = os.environ.get("CHAOXING_WEB_SECRET_KEY") or secrets.token_hex(32)
+    init_storage(DEFAULT_SETTINGS)
+
+    def create_user_state(owner_id: str) -> dict:
+        saved_records = load_records(owner_id)
+        return {
+            "owner_id": owner_id,
+            "client": None,
+            "username": None,
+            "password": None,
+            "display_name": None,
+            "active_session_token": None,
+            "active_session_time": None,
+            "api_session": None,
+            "courses": [],
+            "queue": [],
+            "queue_status": "idle",
+            "activities": list(reversed(saved_records[-20:])),
+            "logs": [],
+            "terminal_logs": [],
+            "progress": {"total": 0, "completed": 0, "failed": 0, "current": "", "played": 0, "duration": 0},
+            "stop_event": Event(),
+            "pause_event": Event(),
+            "worker": None,
+            "lock": RLock(),
+            "records": saved_records,
+            "settings": load_settings(DEFAULT_SETTINGS, owner_id),
+        }
+
+    app.extensions["chaoxing"] = {
+        "users": {},
+        "users_lock": RLock(),
+        "guest": create_user_state("guest"),
+    }
+    active_worker_state = ContextVar("chaoxing_active_worker_state", default=None)
+    api_session_lock = RLock()
+
+    def new_api_session(template):
+        """创建只属于一个 Web 用户的 API 会话，不复用全局 cookie。"""
+        isolated = requests.Session()
+        isolated.headers.update(dict(template.headers))
+        return isolated
+
+    def api_call(current: dict, callback, *args, **kwargs):
+        """在调用未改造的 api/ 代码时临时挂载当前用户的会话。
+
+        api/ 使用单例 SessionManager，因此这里必须串行切换并在调用结束后恢复，
+        否则不同账号会共享最后一次登录的 cookie。
+        """
+        with api_session_lock:
+            import api.base as base_module
+
+            manager = SessionManager.get_instance()
+            previous_session = manager._session
+            original_init = SessionManager.__init__
+            original_update_cookies = SessionManager.__dict__["update_cookies"]
+            original_save_cookies = base_module.save_cookies
+            if current["api_session"] is None:
+                current["api_session"] = new_api_session(previous_session)
+            # api/ 中的 get_instance() 会重复触发 __init__，从而覆盖刚挂载的用户会话。
+            # 只在本次受保护调用期间禁止重复初始化，结束后恢复原实现。
+            SessionManager.__init__ = lambda _self: None
+            SessionManager.update_cookies = classmethod(lambda _cls: None)
+            base_module.save_cookies = lambda source: manager._session.cookies.update(source.cookies)
+            try:
+                manager._session = current["api_session"]
+                return callback(*args, **kwargs)
+            finally:
+                current["api_session"] = manager._session
+                manager._session = previous_session
+                SessionManager.__init__ = original_init
+                SessionManager.update_cookies = original_update_cookies
+                base_module.save_cookies = original_save_cookies
+
+    def owner_id_for(username: str) -> str:
+        username = username.strip()
+        digest = hashlib.sha256(username.casefold().encode("utf-8")).hexdigest()
+        return f"user-{digest}"
+
+    def user_state(owner_id: str) -> dict:
+        registry = app.extensions["chaoxing"]
+        with registry["users_lock"]:
+            if owner_id not in registry["users"]:
+                registry["users"][owner_id] = create_user_state(owner_id)
+            return registry["users"][owner_id]
 
     def terminal_log_sink(message):
         line = str(message).rstrip()
-        if line:
-            with state()["lock"]:
-                state()["terminal_logs"].append(line)
-                state()["terminal_logs"] = state()["terminal_logs"][-300:]
+        current = state() if has_request_context() else active_worker_state.get()
+        if line and current is not None:
+            with current["lock"]:
+                current["terminal_logs"].append(line)
+                current["terminal_logs"] = current["terminal_logs"][-300:]
 
     api_logger.add(terminal_log_sink, level="TRACE", enqueue=False)
 
     def state():
-        return app.extensions["chaoxing"]
+        registry = app.extensions["chaoxing"]
+        owner_id = session.get("user_id") if has_request_context() else None
+        if not owner_id:
+            return registry["guest"]
+        current = user_state(owner_id)
+        session_token = session.get("login_token")
+        if not session_token or session_token != current.get("active_session_token"):
+            return registry["guest"]
+        return current
 
-    def record_event(title: str, detail: str, level: str = "info"):
+    def record_event(title: str, detail: str, level: str = "info", current: dict | None = None):
         now = datetime.now(timezone(timedelta(hours=8)))
         event = {"id": uuid4().hex, "title": title, "detail": detail, "level": level, "time": now.strftime("%H:%M:%S"), "timestamp": now.isoformat()}
-        current = state()
+        current = current or state()
         with current["lock"]:
             current["activities"].insert(0, event)
             current["logs"].insert(0, event)
@@ -237,14 +286,14 @@ def create_app() -> Flask:
             current["logs"] = current["logs"][:100]
             current["records"].append(event)
             current["records"] = current["records"][-500:]
-            save_records(current["records"])
+            save_records(current["records"], current["owner_id"])
 
     def run_job_interruptible(current, course, job, job_info):
         context = mp.get_context("spawn")
         result_queue = context.Queue()
         process = context.Process(
             target=run_job_process,
-            args=(result_queue, current["username"], current["password"], current["use_cookies"], current["settings"], course, job, job_info),
+            args=(result_queue, current["username"], current["password"], current["settings"], course, job, job_info),
             daemon=True,
         )
         process.start()
@@ -288,8 +337,8 @@ def create_app() -> Flask:
             else:
                 final_message = message
 
-    def execute_queue():
-        current = state()
+    def execute_queue(current):
+        active_worker_state.set(current)
         client = current["client"]
         try:
             with current["lock"]:
@@ -305,12 +354,12 @@ def create_app() -> Flask:
                 selected_point_id = str(item.get("pointId") or "")
                 course = next((c for c in current["courses"] if str(c.get("courseId")) == course_id), None)
                 if course is None:
-                    course = next((c for c in client.get_course_list() if str(c.get("courseId")) == course_id), None)
+                    course = next((c for c in api_call(current, client.get_course_list) if str(c.get("courseId")) == course_id), None)
                 if course is None:
-                    record_event("课程执行失败", f"找不到课程：{item.get('name', course_id)}", "error")
+                    record_event("课程执行失败", f"找不到课程：{item.get('name', course_id)}", "error", current)
                     current["progress"]["failed"] += 1
                     continue
-                point_data = client.get_course_point(course["courseId"], course["clazzId"], course.get("cpi"))
+                point_data = api_call(current, client.get_course_point, course["courseId"], course["clazzId"], course.get("cpi"))
                 points = point_data.get("points", []) if isinstance(point_data, dict) else point_data
                 if item_mode == "task":
                     runnable_points = [point for point in points if str(point.get("id") or point.get("knowledgeId")) == selected_point_id]
@@ -326,7 +375,7 @@ def create_app() -> Flask:
                     with current["lock"]:
                         current["queue_status"] = "running"
                         current["progress"]["current"] = f"{course.get('title', course_id)} / {point.get('title', point.get('id', '章节'))}"
-                    jobs, job_info = client.get_job_list(course, point)
+                    jobs, job_info = api_call(current, client.get_job_list, course, point)
                     if item_mode == "task":
                         jobs = [job for job in jobs if str(job.get("jobid") or job.get("jobId") or job.get("id")) == selected_task_id]
                     with current["lock"]:
@@ -350,16 +399,16 @@ def create_app() -> Flask:
                                 current["progress"]["failed"] += 1
                         except Exception as exc:
                             current["progress"]["failed"] += 1
-                            record_event("任务执行失败", f"{job.get('name', '未命名任务')}：{exc}", "error")
+                            record_event("任务执行失败", f"{job.get('name', '未命名任务')}：{exc}", "error", current)
             with current["lock"]:
                 current["queue_status"] = "stopped" if current["stop_event"].is_set() else "completed"
                 current["progress"]["current"] = "已停止" if current["stop_event"].is_set() else "执行完成"
-            record_event("执行队列结束", current["progress"]["current"])
+            record_event("执行队列结束", current["progress"]["current"], current=current)
         except Exception as exc:
             with current["lock"]:
                 current["queue_status"] = "error"
                 current["progress"]["current"] = "执行异常"
-            record_event("执行器异常", str(exc), "error")
+            record_event("执行器异常", str(exc), "error", current)
 
     def normalized_course(course: dict) -> dict:
         return {
@@ -394,22 +443,43 @@ def create_app() -> Flask:
 
     @app.get("/execution")
     def execution_center():
+        if state()["client"] is None:
+            return redirect("/")
         return render_template("execution.html")
 
     @app.get("/courses")
     def course_management():
+        if state()["client"] is None:
+            return redirect("/")
         return render_template("courses.html")
 
     @app.get("/records")
     def run_records():
+        if state()["client"] is None:
+            return redirect("/")
         return render_template("records.html")
 
     @app.get("/settings")
     def system_settings():
+        if state()["client"] is None:
+            return redirect("/")
         return render_template("settings.html")
 
     @app.get("/api/session")
     def session_status():
+        owner_id = session.get("user_id")
+        if owner_id:
+            owner_state = user_state(owner_id)
+            session_token = session.get("login_token")
+            active_token = owner_state.get("active_session_token")
+            if active_token and session_token != active_token:
+                return jsonify({
+                    "authenticated": False,
+                    "username": None,
+                    "displayName": None,
+                    "message": "此账号已在别处登录",
+                    "loginTime": owner_state.get("active_session_time"),
+                })
         current = state()
         return jsonify({"authenticated": current["client"] is not None, "username": current["username"], "displayName": current["display_name"]})
 
@@ -418,30 +488,41 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         username = str(payload.get("username", "")).strip()
         password = str(payload.get("password", ""))
-        use_cookies = bool(payload.get("use_cookies", False))
-        if not use_cookies and (not username or not password):
+        if not username or not password:
             return jsonify({"ok": False, "message": "请输入账号和密码"}), 400
 
-        current = state()
+        owner_id = owner_id_for(username)
+        current = user_state(owner_id)
+        previous_owner_id = session.get("user_id")
+        previous_current = state()
         with current["lock"]:
             client = Chaoxing(Account(username, password))
-            result = client.login(login_with_cookies=use_cookies)
+            result = api_call(current, client.login)
             if not result.get("status"):
+                if previous_owner_id:
+                    session["user_id"] = previous_owner_id
                 return jsonify({"ok": False, "message": result.get("msg", "登录失败")}), 401
             current["client"] = client
             client.tiku = DummyTiku()
-            current["username"] = username or "Cookie 登录"
+            current["username"] = username
             current["password"] = password
-            current["use_cookies"] = use_cookies
             current["stop_event"].clear()
             current["pause_event"].clear()
             try:
-                current["display_name"] = client.get_name() or current["username"]
+                current["display_name"] = api_call(current, client.get_name) or current["username"]
             except Exception:
                 current["display_name"] = current["username"]
             current["courses"] = []
             current["queue"] = []
             current["queue_status"] = "idle"
+            if previous_owner_id and previous_owner_id != owner_id:
+                previous_current["stop_event"].set()
+                previous_current["pause_event"].clear()
+            login_token = uuid4().hex
+            current["active_session_token"] = login_token
+            current["active_session_time"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+            session["user_id"] = owner_id
+            session["login_token"] = login_token
             record_event("登录成功", f"已登录账号：{current['display_name']}")
         return jsonify({"ok": True, "message": result.get("msg", "登录成功"), "username": current["username"], "displayName": current["display_name"]})
 
@@ -455,20 +536,22 @@ def create_app() -> Flask:
             current["client"] = None
             current["username"] = None
             current["password"] = None
-            current["use_cookies"] = False
             current["display_name"] = None
             current["queue_status"] = "stopping" if current["worker"] and current["worker"].is_alive() else ("queued" if current["queue"] else "idle")
             record_event("退出登录", "当前会话已清除")
+        session.pop("user_id", None)
+        session.pop("login_token", None)
         return jsonify({"ok": True})
 
     @app.get("/api/courses")
     def courses():
-        client = state()["client"]
+        current = state()
+        client = current["client"]
         if client is None:
             return jsonify({"ok": False, "message": "请先登录"}), 401
         try:
-            result = client.get_course_list()
-            state()["courses"] = result
+            result = api_call(current, client.get_course_list)
+            current["courses"] = result
             record_event("课程同步完成", f"获取到 {len(result)} 门课程")
             return jsonify({"ok": True, "courses": [normalized_course(course) for course in result]})
         except Exception as exc:
@@ -476,18 +559,19 @@ def create_app() -> Flask:
 
     @app.get("/api/overview")
     def overview():
-        client = state()["client"]
+        current = state()
+        client = current["client"]
         if client is None:
             return jsonify({"ok": False, "message": "请先登录"}), 401
         try:
-            course_list = state()["courses"] or client.get_course_list()
-            if not state()["courses"]:
-                state()["courses"] = course_list
+            course_list = current["courses"] or api_call(current, client.get_course_list)
+            if not current["courses"]:
+                current["courses"] = course_list
             pending_tasks = 0
             total_tasks = 0
             chapters = 0
             for course in course_list:
-                point_data = client.get_course_point(course["courseId"], course["clazzId"], course.get("cpi"))
+                point_data = api_call(current, client.get_course_point, course["courseId"], course["clazzId"], course.get("cpi"))
                 points = point_data.get("points", []) if isinstance(point_data, dict) else point_data
                 chapters += len(points)
                 for point in points:
@@ -543,6 +627,8 @@ def create_app() -> Flask:
     @app.get("/api/tasks/status")
     def task_status():
         current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
         progress = dict(current["progress"])
         progress["playedText"] = format_duration(progress.get("played", 0))
         progress["durationText"] = format_duration(progress.get("duration", 0))
@@ -559,6 +645,8 @@ def create_app() -> Flask:
     @app.delete("/api/tasks/queue/<course_id>")
     def remove_queued_course(course_id: str):
         current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
         if current["queue_status"] in {"running", "paused", "stopping"}:
             return jsonify({"ok": False, "message": "执行期间不能修改队列"}), 409
         task_id = request.args.get("task_id")
@@ -593,7 +681,7 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "message": "执行队列当前正在运行或停止中"}), 409
         current["stop_event"].clear()
         current["pause_event"].clear()
-        current["worker"] = Thread(target=execute_queue, daemon=True)
+        current["worker"] = Thread(target=execute_queue, args=(current,), daemon=True)
         current["worker"].start()
         record_event("开始执行队列", f"共 {len(current['queue'])} 门课程")
         return jsonify({"ok": True, "status": "running"})
@@ -623,11 +711,16 @@ def create_app() -> Flask:
 
     @app.get("/api/activities")
     def activities():
-        return jsonify({"ok": True, "activities": state()["activities"][:10]})
+        current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
+        return jsonify({"ok": True, "activities": current["activities"][:10]})
 
     @app.get("/api/records")
     def records():
         current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
         with current["lock"]:
             records = list(reversed(current["records"][-500:]))
         return jsonify({"ok": True, "records": records})
@@ -635,16 +728,20 @@ def create_app() -> Flask:
     @app.delete("/api/records")
     def clear_records():
         current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
         with current["lock"]:
             current["records"] = []
             current["activities"] = []
             current["logs"] = []
-            save_records([])
+            save_records([], current["owner_id"])
         return jsonify({"ok": True, "message": "运行记录已全部删除"})
 
     @app.delete("/api/records/<record_id>")
     def delete_record(record_id: str):
         current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
         with current["lock"]:
             before = len(current["records"])
             current["records"] = [record for record in current["records"] if str(record.get("id")) != str(record_id)]
@@ -652,12 +749,15 @@ def create_app() -> Flask:
                 return jsonify({"ok": False, "message": "记录不存在"}), 404
             current["activities"] = [record for record in current["activities"] if str(record.get("id")) != str(record_id)]
             current["logs"] = [record for record in current["logs"] if str(record.get("id")) != str(record_id)]
-            save_records(current["records"])
+            save_records(current["records"], current["owner_id"])
         return jsonify({"ok": True})
 
     @app.get("/api/settings")
     def get_settings():
-        return jsonify({"ok": True, "settings": state()["settings"]})
+        current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
+        return jsonify({"ok": True, "settings": current["settings"]})
 
     @app.get("/api/settings/defaults")
     def get_default_settings():
@@ -670,31 +770,37 @@ def create_app() -> Flask:
         if not isinstance(incoming, dict):
             return jsonify({"ok": False, "message": "配置格式不正确"}), 400
         current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
         with current["lock"]:
             for section, values in incoming.items():
                 if section in current["settings"] and isinstance(values, dict):
                     for key, value in values.items():
                         if key in current["settings"][section]:
                             current["settings"][section][key] = value
-            save_settings(current["settings"])
+            save_settings(current["settings"], current["owner_id"])
             record_event("系统设置已保存", "配置已写入本地设置文件")
         return jsonify({"ok": True, "settings": current["settings"]})
 
     @app.get("/api/logs")
     def logs():
-        info_lines = [line for line in state()["terminal_logs"] if "| INFO" in line or " INFO    " in line]
+        current = state()
+        if current["client"] is None:
+            return jsonify({"ok": False, "message": "请先登录"}), 401
+        info_lines = [line for line in current["terminal_logs"] if "| INFO" in line or " INFO    " in line]
         return jsonify({"ok": True, "lines": info_lines[-300:]})
 
     @app.get("/api/courses/<course_id>/chapters")
     def chapters(course_id: str):
-        client = state()["client"]
+        current = state()
+        client = current["client"]
         if client is None:
             return jsonify({"ok": False, "message": "请先登录"}), 401
         try:
-            course = find_course(client, course_id)
+            course = api_call(current, find_course, client, course_id)
             if course is None:
                 return jsonify({"ok": False, "message": "课程不存在"}), 404
-            point_data = client.get_course_point(course["courseId"], course["clazzId"], course.get("cpi"))
+            point_data = api_call(current, client.get_course_point, course["courseId"], course["clazzId"], course.get("cpi"))
             points = point_data.get("points", []) if isinstance(point_data, dict) else point_data
             record_event("章节读取完成", f"{normalized_course(course)['name']}：读取到 {len(points)} 个章节")
             return jsonify({"ok": True, "course": normalized_course(course), "locked": bool(point_data.get("hasLocked")) if isinstance(point_data, dict) else False, "chapters": [normalized_point(point) for point in points]})
@@ -703,15 +809,16 @@ def create_app() -> Flask:
 
     @app.get("/api/courses/<course_id>/chapters/<point_id>/tasks")
     def tasks(course_id: str, point_id: str):
-        client = state()["client"]
+        current = state()
+        client = current["client"]
         if client is None:
             return jsonify({"ok": False, "message": "请先登录"}), 401
         try:
-            course = find_course(client, course_id)
+            course = api_call(current, find_course, client, course_id)
             if course is None:
                 return jsonify({"ok": False, "message": "课程不存在"}), 404
             point = {"id": point_id}
-            jobs, job_info = client.get_job_list(course, point)
+            jobs, job_info = api_call(current, client.get_job_list, course, point)
             record_event("任务点读取完成", f"课程 {normalized_course(course)['name']}：读取到 {len(jobs)} 个任务点")
             return jsonify({"ok": True, "tasks": jobs, "info": job_info})
         except Exception as exc:

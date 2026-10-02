@@ -31,7 +31,7 @@
           <button class="nav-item" data-section="运行记录"><span>↺</span>运行记录</button>
           <button class="nav-item" data-section="系统设置"><span>⚙</span>系统设置</button>
         </nav>
-        <div class="sidebar-foot">本地控制台<br>演示版本 · v0.1.0</div>
+        <div class="sidebar-foot">演示版本 · v0.1.1</div>
       </aside>
 
       <main class="main">
@@ -76,7 +76,6 @@
         <div class="dialog-head"><div><div class="eyebrow">ACCOUNT</div><h2>登录超星</h2></div><button class="close-button" value="cancel" aria-label="关闭">×</button></div>
         <label>手机号<input name="username" autocomplete="username" placeholder="请输入手机号"></label>
         <label>密码<input name="password" type="password" autocomplete="current-password" placeholder="请输入密码"></label>
-        <label class="check-row"><input name="use_cookies" type="checkbox"> 使用本地 cookies.txt 登录</label>
         <p class="dialog-hint">账号密码仅用于本次本地运行，不会提交到其他服务。</p>
         <button class="primary dialog-submit" value="default" type="submit">登录并同步课程</button>
       </form>
@@ -85,6 +84,7 @@
       <div class="dialog-head"><div><div class="eyebrow">ACTIVITY LOG</div><h2>运行日志</h2></div><button class="close-button" id="close-log" type="button" aria-label="关闭">×</button></div>
       <div class="log-list" id="log-list"></div>
     </dialog>
+    <script src="{{ url_for('static', filename='js/session-guard.js') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
   </body>
 </html>

@@ -8,12 +8,18 @@
   let executionStatus = "idle";
   let executionPoller = null;
   let timer;
-  const show = (message) => {
+  const show = (message, duration = 2200) => {
     toast.textContent = message;
     toast.classList.add("show");
     clearTimeout(timer);
-    timer = setTimeout(() => toast.classList.remove("show"), 2200);
+    timer = setTimeout(() => toast.classList.remove("show"), duration);
   };
+
+  const replacedSessionMessage = window.sessionStorage.getItem("session-replaced-message");
+  if (replacedSessionMessage) {
+    window.sessionStorage.removeItem("session-replaced-message");
+    setTimeout(() => show(replacedSessionMessage.replace(/\n/g, " · "), 6500), 220);
+  }
 
   let authenticatedState = false;
 
@@ -239,7 +245,7 @@
     const response = await fetch("/api/auth/login", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({username: form.get("username"), password: form.get("password"), use_cookies: form.get("use_cookies") === "on"}),
+      body: JSON.stringify({username: form.get("username"), password: form.get("password")}),
     });
     const result = await response.json();
     if (!response.ok) {
